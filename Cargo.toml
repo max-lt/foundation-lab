@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["relay", "backend"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+async-channel = "2"
+futures-lite = "2"
+bytes = "1"
+thiserror = "2"
+hex = "0.4"
+log = "0.4"
+env_logger = "0.11"
+
+# Protocol crates pinned to the EXACT revisions the running KeyOS sim is
+# built against (see KeyOS-dev/Cargo.lock): ql-* at branch ql-v2 commit
+# 63ef28e, btp at tag 5.4.6 (commit 2be09d6). The backend speaks the same
+# wire as the device or the XX pairing handshake will not validate.
+ql-wire = { git = "https://github.com/Foundation-Devices/foundation-api", rev = "63ef28e324fc0c039f04c061067da0f4acc4c915", features = ["test-utils"] }
+ql-fsm = { git = "https://github.com/Foundation-Devices/foundation-api", rev = "63ef28e324fc0c039f04c061067da0f4acc4c915" }
+ql-runtime = { git = "https://github.com/Foundation-Devices/foundation-api", rev = "63ef28e324fc0c039f04c061067da0f4acc4c915", features = ["rpc", "log"] }
+ql-rpc = { git = "https://github.com/Foundation-Devices/foundation-api", rev = "63ef28e324fc0c039f04c061067da0f4acc4c915" }
+btp = { git = "https://github.com/Foundation-Devices/foundation-api", tag = "5.4.6" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

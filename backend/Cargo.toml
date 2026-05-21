@@ -1,0 +1,20 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ql-wire = { workspace = true }
+ql-fsm = { workspace = true }
+ql-runtime = { workspace = true }
+ql-rpc = { workspace = true }
+btp = { workspace = true }
+
+tokio = { workspace = true }
+async-channel = { workspace = true }
+futures-lite = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
