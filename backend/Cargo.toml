@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["chat"]
+chat = []
+
 [dependencies]
 ql-wire = { workspace = true }
 ql-fsm = { workspace = true }

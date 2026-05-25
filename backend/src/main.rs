@@ -2,14 +2,19 @@
 //!
 //! Topology:  device-sim ──TCP:8765──► relay ──TCP:8766──► THIS
 //!
-//! This process is the QL v2 *initiator*. It:
-//!   1. connects to the relay (which forwards opaquely to the sim's BLE
-//!      bridge),
-//!   2. runs the XX *pairing* handshake using the out-of-band pairing
-//!      token the device printed (`QLV2_PAIRING_QR <ble>:<hex token>`),
-//!   3. once the session is up, drives the device's RPC surface as a
-//!      client: an `Echo` round-trip, then a `BytesBenchmark` download to
-//!      measure end-to-end throughput across the real three-hop path.
+//! This process is the QL v2 *initiator*. Two modes, auto-selected by
+//! whether the state file (`--state`) exists:
+//!
+//!   * XX (no state file): fresh pairing. Runs the XX handshake with the
+//!     out-of-band token the device printed (`QLV2_PAIRING_QR ...`), then
+//!     persists our identity + the device's PeerBundle to the state file.
+//!   * IK (state file present): reconnect to an already-known peer.
+//!     Loads the saved identity + bundle, does `bind_peer` + `connect` —
+//!     no token needed. This is what a real companion does on every
+//!     connection after the one-time pairing.
+//!
+//! Either way, once the session is up it drives the device's RPC surface
+//! as a client: an `Echo` round-trip then a `BytesBenchmark` download.
 //!
 //! Wire stack mirrors the device exactly:
 //!   QL2 record  ⇄  btp chunk(s)  ⇄  4-byte length-prefixed TCP frame
@@ -18,6 +23,7 @@
 
 use std::{
     future::Future,
+    path::Path,
     pin::Pin,
     str::Utf8Error,
     task::{Context, Poll},
@@ -28,13 +34,20 @@ use async_channel::{Receiver, Sender};
 use bytes::{Buf, BufMut};
 use futures_lite::Stream;
 use ql_fsm::{PeerStatus, QlFsmConfig};
-use ql_rpc::{request::Request, subscription::Subscription, RouteId, RpcCodec};
+use ql_rpc::{
+    download::Download, request::Request, subscription::Subscription, DownloadHandler,
+    DownloadResponder, RequestHandler, Response, RouteId, Router, RpcCodec, RpcStream, SendSpawn,
+    SubscriptionHandler, SubscriptionResponder,
+};
+#[cfg(feature = "chat")]
+use ql_rpc::notification::Notification;
 use ql_runtime::{
     new_runtime, QlInbound, QlPlatform, QlStream, QlTimer, RuntimeConfig, RuntimeHandle,
 };
 use ql_wire::{
     test_identity, MlKemCiphertext, MlKemKeyPair, MlKemPrivateKey, MlKemPublicKey, Nonce,
-    PairingToken, PeerBundle, QlAead, QlHash, QlKem, QlRandom, SessionKey, SoftwareCrypto, XID,
+    PairingToken, PeerBundle, QlAead, QlHash, QlIdentity, QlKem, QlRandom, SessionKey,
+    SoftwareCrypto, WireDecode, WireEncode, XID,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -43,6 +56,8 @@ use tokio::{
 };
 
 const DEFAULT_RELAY: &str = "127.0.0.1:8766";
+/// Persisted (identity ‖ peer bundle) — its presence selects IK vs XX mode.
+const DEFAULT_STATE: &str = "/tmp/ql-link-lab-peer.state";
 
 // ===== RPC surface (must match KeyOS-dev/test-apps/gui-app-qlv2/src/rpc.rs) =====
 
@@ -85,6 +100,197 @@ impl RpcCodec for BenchmarkRequest {
     }
 }
 
+struct DownloadBenchmark;
+
+impl Download for DownloadBenchmark {
+    type Error = std::convert::Infallible;
+    type Request = DownloadBenchmarkRequest;
+    type ResponseHeader = DownloadBenchmarkHeader;
+
+    const ROUTE: RouteId = RouteId(3);
+}
+
+#[derive(Clone)]
+struct DownloadBenchmarkRequest {
+    length: u64,
+}
+
+impl RpcCodec for DownloadBenchmarkRequest {
+    type Error = std::convert::Infallible;
+
+    fn encode_value<B: BufMut + ?Sized>(&self, out: &mut B) {
+        out.put_u64(self.length);
+    }
+
+    fn decode_value<B: Buf>(bytes: &mut B) -> Result<Self, Self::Error> {
+        Ok(Self {
+            length: bytes.get_u64(),
+        })
+    }
+}
+
+struct DownloadBenchmarkHeader {
+    hash: Vec<u8>,
+}
+
+impl RpcCodec for DownloadBenchmarkHeader {
+    type Error = std::convert::Infallible;
+
+    // The device's `decode_value` uses `Vec::<u8>::decode_value` (length-prefixed),
+    // so we encode the same way. The device's own `encode_value` (in
+    // `KeyOS-dev/test-apps/gui-app-qlv2/src/rpc.rs`) uses `put_slice` with no
+    // length prefix — that's an encode/decode asymmetry on the device side,
+    // benign because the device is client-only for this RPC.
+    fn encode_value<B: BufMut + ?Sized>(&self, out: &mut B) {
+        Vec::<u8>::encode_value(&self.hash, out);
+    }
+
+    fn decode_value<B: Buf>(bytes: &mut B) -> Result<Self, Self::Error> {
+        Ok(Self {
+            hash: Vec::<u8>::decode_value(bytes)?,
+        })
+    }
+}
+
+// ===== Chat (feature-gated) RPC types =====
+//
+// Mirrors `KeyOS-dev/test-apps/gui-app-chat/src/rpc.rs`. ChatSend is a Request
+// (device → backend) because api/ql exposes `request` but not `notification`.
+// ChatPush is a Notification (backend → device) because backend's ql-runtime
+// `RpcHandle` exposes `notification`, and the device just serves it via a
+// NotificationHandler<ChatPush> in its Router.
+
+#[cfg(feature = "chat")]
+struct ChatSend;
+#[cfg(feature = "chat")]
+impl Request for ChatSend {
+    type Error = std::str::Utf8Error;
+    type Request = String;
+    type Response = String;
+    const ROUTE: RouteId = RouteId(100);
+}
+
+#[cfg(feature = "chat")]
+struct ChatPush;
+#[cfg(feature = "chat")]
+impl Notification for ChatPush {
+    type Error = std::str::Utf8Error;
+    type Payload = String;
+    const ROUTE: RouteId = RouteId(101);
+}
+
+// ===== RPC server side (serve mode) =====
+//
+// When the *device* initiates ("Send Echo" in gui-app-qlv2), it is the RPC
+// client and we must answer. A `Router` dispatches each inbound stream to a
+// handler. `RouterState` is stateless — Echo just reflects the payload.
+
+#[derive(Clone)]
+struct RouterState;
+
+impl RequestHandler<Echo, QlStream> for RouterState {
+    fn handle(self, message: String, responder: Response<String, <QlStream as RpcStream>::Writer>) {
+        println!("[backend] ← inbound Echo {message:?} — spawning respond task");
+        let echoed = message.clone();
+        tokio::spawn(async move {
+            println!("[backend]   .. respond task started, calling respond({echoed:?})");
+            match responder.respond(echoed.clone()).await {
+                Ok(()) => println!("[backend]   .. respond OK ({echoed:?})"),
+                Err(e) => eprintln!("[backend]   .. respond FAILED ({echoed:?}): {e:?}"),
+            }
+        });
+    }
+}
+
+// Stream `request.length` bytes back to the subscriber in 4 KiB chunks.
+const BENCHMARK_CHUNK_LEN: usize = 4 * 1024;
+
+impl SubscriptionHandler<BytesBenchmark, QlStream> for RouterState {
+    fn handle(
+        self,
+        request: BenchmarkRequest,
+        mut responder: SubscriptionResponder<Vec<u8>, <QlStream as RpcStream>::Writer>,
+    ) {
+        let total = request.length as usize;
+        println!("[backend] ← inbound BytesBenchmark subscription, length={total} — streaming");
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let mut remaining = total;
+            while remaining > 0 {
+                let n = remaining.min(BENCHMARK_CHUNK_LEN);
+                if let Err(e) = responder.send(vec![0u8; n]).await {
+                    eprintln!("[backend]   .. BytesBenchmark send failed at {} B: {e:?}", total - remaining);
+                    return;
+                }
+                remaining -= n;
+            }
+            match responder.finish().await {
+                Ok(()) => println!(
+                    "[backend]   .. BytesBenchmark OK ({total} B in {:.2}s)",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => eprintln!("[backend]   .. BytesBenchmark finish FAILED: {e:?}"),
+            }
+        });
+    }
+}
+
+#[cfg(feature = "chat")]
+impl RequestHandler<ChatSend, QlStream> for RouterState {
+    fn handle(self, message: String, responder: Response<String, <QlStream as RpcStream>::Writer>) {
+        println!("[backend] chat ← from device: {message:?}");
+        tokio::spawn(async move {
+            // Ack with the same text — keeps the device UI flow simple and
+            // confirms end-to-end delivery.
+            let _ = responder.respond(message).await;
+        });
+    }
+}
+
+impl DownloadHandler<DownloadBenchmark, QlStream> for RouterState {
+    fn handle(
+        self,
+        request: DownloadBenchmarkRequest,
+        responder: DownloadResponder<DownloadBenchmarkHeader, <QlStream as RpcStream>::Writer>,
+    ) {
+        let total = request.length as usize;
+        println!("[backend] ← inbound DownloadBenchmark, length={total} — preparing payload + sha256");
+        tokio::spawn(async move {
+            // Build the deterministic payload (zeros) and its SHA-256 so the
+            // device can verify integrity if it wants.
+            let payload = vec![0u8; total];
+            let hash = SoftwareCrypto.sha256(&[&payload]).to_vec();
+            let started = Instant::now();
+            let mut writer = match responder.respond(DownloadBenchmarkHeader { hash }).await {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("[backend]   .. DownloadBenchmark header send FAILED: {e:?}");
+                    return;
+                }
+            };
+            let mut remaining = total;
+            let mut offset = 0;
+            while remaining > 0 {
+                let n = remaining.min(BENCHMARK_CHUNK_LEN);
+                let chunk = bytes::Bytes::copy_from_slice(&payload[offset..offset + n]);
+                if let Err(e) = writer.send(chunk).await {
+                    eprintln!("[backend]   .. DownloadBenchmark body send failed at {offset} B: {e:?}");
+                    return;
+                }
+                offset += n;
+                remaining -= n;
+            }
+            match writer.finish().await {
+                Ok(()) => println!(
+                    "[backend]   .. DownloadBenchmark OK ({total} B in {:.2}s)",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => eprintln!("[backend]   .. DownloadBenchmark finish FAILED: {e:?}"),
+            }
+        });
+    }
+}
+
 // ===== entry point =====
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -101,11 +307,15 @@ async fn main() {
     let mut relay = DEFAULT_RELAY.to_string();
     let mut token_hex: Option<String> = None;
     let mut bench_len: u32 = 256 * 1024;
+    let mut state_path = DEFAULT_STATE.to_string();
+    let mut serve = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--relay" => relay = args.next().expect("--relay needs an address"),
             "--token" => token_hex = Some(args.next().expect("--token needs a value")),
+            "--state" => state_path = args.next().expect("--state needs a path"),
+            "--serve" => serve = true,
             "--bench-bytes" => {
                 bench_len = args
                     .next()
@@ -117,19 +327,27 @@ async fn main() {
         }
     }
 
-    let token = parse_token(&token_hex.expect(
-        "pass --token <hex>  (the part after the last ':' in the sim's \
-         `QLV2_PAIRING_QR 12:34:56:78:9A:BC:<hex>` log line)",
-    ));
+    // The presence of the state file selects the mode: a saved
+    // (identity ‖ peer bundle) means we've paired before → reconnect IK.
+    let ik_mode = Path::new(&state_path).exists();
 
     println!("[backend] connecting to relay {relay}");
     let stream = TcpStream::connect(&relay)
         .await
         .unwrap_or_else(|e| panic!("[backend] cannot reach relay {relay}: {e}"));
     stream.set_nodelay(true).ok();
-    println!("[backend] relay link up; starting XX pairing");
 
-    let identity = test_identity(&SoftwareCrypto);
+    // IK mode reuses the identity the device already knows; XX mints a fresh one.
+    let (identity, ik_bundle) = if ik_mode {
+        let (id, bundle) = load_state(&state_path);
+        println!("[backend] IK mode — reconnecting to known peer (state: {state_path})");
+        (id, Some(bundle))
+    } else {
+        println!("[backend] XX mode — fresh pairing (no state at {state_path})");
+        (test_identity(&SoftwareCrypto), None)
+    };
+    let identity_to_save = identity.clone();
+
     let (platform, plumbing) = BackendPlatform::new();
     let (runtime, handle) = new_runtime(identity, platform, ble_config());
 
@@ -139,13 +357,72 @@ async fn main() {
     });
     spawn_tcp_btp_bridge(plumbing.outbound_rx, plumbing.inbound_tx, stream);
 
-    handle.start_pairing(token);
+    let what = if let Some(bundle) = ik_bundle {
+        handle.bind_peer(bundle);
+        handle.connect();
+        "IK reconnect"
+    } else {
+        let token = parse_token(&token_hex.expect(
+            "XX mode needs --token <hex>  (the part after the last ':' in the \
+             sim's `QLV2_PAIRING_QR 12:34:56:78:9A:BC:<hex>` log line)",
+        ));
+        handle.start_pairing(token);
+        "XX pairing"
+    };
 
     match await_status(&plumbing.status_rx, PeerStatus::Connected, Duration::from_secs(30)).await {
-        Ok(()) => println!("[backend] *** QL v2 session ESTABLISHED (XX pairing complete) ***"),
+        Ok(()) => println!("[backend] *** QL v2 session ESTABLISHED ({what} complete) ***"),
         Err(()) => {
-            eprintln!("[backend] pairing did not complete within 30s — aborting");
+            eprintln!("[backend] {what} did not complete within 30s — aborting");
             std::process::exit(1);
+        }
+    }
+
+    // After a fresh XX pairing, persist (our identity ‖ device bundle) so
+    // the next run reconnects via IK with no token — the steady-state path.
+    if !ik_mode {
+        match tokio::time::timeout(Duration::from_secs(3), plumbing.peer_rx.recv()).await {
+            Ok(Ok(bundle)) => {
+                save_state(&state_path, &identity_to_save, &bundle);
+                println!("[backend] saved peer state to {state_path} — next run reconnects via IK");
+            }
+            _ => eprintln!("[backend] warning: no peer bundle captured — cannot save IK state"),
+        }
+    }
+
+    // Serve mode: become a daemon. Stand up a Router and answer RPC the
+    // *device* initiates (e.g. "Send Echo" in gui-app-qlv2). Runs forever.
+    if serve {
+        println!(
+            "[backend] serve mode — Router up (Echo). Waiting for device-initiated RPC; Ctrl-C to stop."
+        );
+        let builder = Router::<RouterState, QlStream, SendSpawn>::builder(SendSpawn)
+            .request::<Echo>()
+            .subscription::<BytesBenchmark>()
+            .download::<DownloadBenchmark>();
+        #[cfg(feature = "chat")]
+        let builder = builder.request::<ChatSend>();
+        let router = builder.build(RouterState);
+
+        #[cfg(feature = "chat")]
+        {
+            let push_handle = handle.clone();
+            tokio::spawn(chat_input_loop(push_handle, "127.0.0.1:9999".to_string()));
+        }
+        loop {
+            match plumbing.inbound_streams_rx.recv().await {
+                Ok(stream) => match router.handle(stream) {
+                    Some((route, fut)) => {
+                        println!("[backend] serving inbound RPC on {route:?}");
+                        tokio::spawn(fut);
+                    }
+                    None => eprintln!("[backend] inbound stream for an unrouted route — dropped"),
+                },
+                Err(_) => {
+                    eprintln!("[backend] inbound stream channel closed — session gone, exiting");
+                    return;
+                }
+            }
         }
     }
 
@@ -153,6 +430,29 @@ async fn main() {
     run_benchmark(&handle, bench_len).await;
 
     println!("[backend] done — closing session");
+}
+
+/// Persist `(identity ‖ peer bundle)` — both fixed-size wire encodings,
+/// simply concatenated.
+fn save_state(path: &str, identity: &QlIdentity, bundle: &PeerBundle) {
+    let mut buf = identity.encode_vec();
+    buf.extend_from_slice(&bundle.encode_vec());
+    std::fs::write(path, &buf).unwrap_or_else(|e| panic!("cannot write state {path}: {e}"));
+}
+
+fn load_state(path: &str) -> (QlIdentity, PeerBundle) {
+    let buf = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read state {path}: {e}"));
+    let split = QlIdentity::WIRE_SIZE;
+    if buf.len() != split + PeerBundle::WIRE_SIZE {
+        panic!(
+            "state file {path} is {} bytes, expected {}",
+            buf.len(),
+            split + PeerBundle::WIRE_SIZE
+        );
+    }
+    let identity = QlIdentity::decode_exact(&buf[..split]).expect("decode identity from state");
+    let bundle = PeerBundle::decode_exact(&buf[split..]).expect("decode peer bundle from state");
+    (identity, bundle)
 }
 
 async fn run_echo(handle: &RuntimeHandle) {
@@ -330,12 +630,16 @@ struct Plumbing {
     outbound_rx: Receiver<Vec<u8>>,
     inbound_tx: Sender<Vec<u8>>,
     status_rx: Receiver<PeerStatus>,
+    peer_rx: Receiver<PeerBundle>,
+    inbound_streams_rx: Receiver<QlStream>,
 }
 
 struct BackendPlatform {
     outbound: Sender<Vec<u8>>,
     inbound: Option<Receiver<Vec<u8>>>,
     status: Sender<PeerStatus>,
+    peer: Sender<PeerBundle>,
+    inbound_streams: Sender<QlStream>,
     crypto: SoftwareCrypto,
 }
 
@@ -344,17 +648,23 @@ impl BackendPlatform {
         let (outbound_tx, outbound_rx) = async_channel::unbounded();
         let (inbound_tx, inbound_rx) = async_channel::unbounded();
         let (status_tx, status_rx) = async_channel::unbounded();
+        let (peer_tx, peer_rx) = async_channel::unbounded();
+        let (inbound_streams_tx, inbound_streams_rx) = async_channel::unbounded();
         (
             Self {
                 outbound: outbound_tx,
                 inbound: Some(inbound_rx),
                 status: status_tx,
+                peer: peer_tx,
+                inbound_streams: inbound_streams_tx,
                 crypto: SoftwareCrypto,
             },
             Plumbing {
                 outbound_rx,
                 inbound_tx,
                 status_rx,
+                peer_rx,
+                inbound_streams_rx,
             },
         )
     }
@@ -471,14 +781,21 @@ impl QlPlatform for BackendPlatform {
         }
     }
 
-    fn persist_peer(&self, _peer: PeerBundle) {}
+    fn persist_peer(&self, peer: PeerBundle) {
+        log::info!("[peer] runtime persisted a peer bundle (XX pairing established a new peer)");
+        let _ = self.peer.try_send(peer);
+    }
 
     fn handle_peer_status(&self, peer: Option<XID>, status: PeerStatus) {
         log::info!("[status] peer={peer:?} status={status:?}");
         let _ = self.status.try_send(status);
     }
 
-    fn handle_inbound(&self, _stream: QlStream) {}
+    fn handle_inbound(&self, stream: QlStream) {
+        // The peer opened a stream to us (device-initiated RPC). Hand it
+        // to the serve loop; if no one is serving, it's simply dropped.
+        let _ = self.inbound_streams.try_send(stream);
+    }
 }
 
 async fn await_status(
@@ -496,4 +813,48 @@ async fn await_status(
         }
     };
     tokio::time::timeout(timeout, fut).await.map_err(|_| ())
+}
+
+/// Chat input loop: listens on TCP, reads lines, pushes each as a ChatPush
+/// notification to the connected device. Pipe a line to the listener to send
+/// (e.g. `echo "hi" | nc 127.0.0.1 9999`).
+#[cfg(feature = "chat")]
+async fn chat_input_loop(handle: RuntimeHandle, addr: String) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[backend] chat input: cannot bind {addr}: {e}");
+            return;
+        }
+    };
+    println!(
+        "[backend] chat input: pipe a line to {addr} \
+         (e.g. `echo hi | nc 127.0.0.1 9999`) to push to the device"
+    );
+
+    loop {
+        let (sock, peer) = match listener.accept().await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[backend] chat input accept: {e}");
+                continue;
+            }
+        };
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(sock).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.is_empty() {
+                    continue;
+                }
+                println!("[backend] chat → device (from {peer}): {line:?}");
+                if let Err(e) = handle.rpc().notification::<ChatPush>(&line).await {
+                    eprintln!("[backend] chat push failed: {e:?}");
+                }
+            }
+        });
+    }
 }
