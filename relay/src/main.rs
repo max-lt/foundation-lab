@@ -37,12 +37,16 @@ async fn main() {
                 continue;
             }
         };
-        println!("[relay] backend connected from {backend_addr}; dialing device bridge {DEVICE_BRIDGE}");
+        println!(
+            "[relay] backend connected from {backend_addr}; dialing device bridge {DEVICE_BRIDGE}"
+        );
 
         let device = match TcpStream::connect(DEVICE_BRIDGE).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[relay] cannot reach device bridge {DEVICE_BRIDGE}: {e} — dropping backend");
+                eprintln!(
+                    "[relay] cannot reach device bridge {DEVICE_BRIDGE}: {e} — dropping backend"
+                );
                 continue;
             }
         };
@@ -69,7 +73,10 @@ async fn handle_link(mut backend: TcpStream, mut device: TcpStream, who: String)
             );
         }
         Err(e) => {
-            eprintln!("[relay] link {who} error after {:.1}s: {e}", started.elapsed().as_secs_f64());
+            eprintln!(
+                "[relay] link {who} error after {:.1}s: {e}",
+                started.elapsed().as_secs_f64()
+            );
         }
     }
 }

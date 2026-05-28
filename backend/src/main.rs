@@ -31,14 +31,17 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use futures_lite::Stream;
-use ql_api::{route, BenchmarkEvent, BenchmarkRequest, DownloadBenchmarkHeader, DownloadBenchmarkPartHeader, DownloadBenchmarkRequest, EchoRequest, EchoResponse};
+use ql_api::{
+    route, BenchmarkEvent, BenchmarkRequest, DownloadBenchmarkHeader, DownloadBenchmarkPartHeader,
+    DownloadBenchmarkRequest, EchoRequest, EchoResponse,
+};
 use ql_fsm::{PairingInvite, PeerStatus, QlFsmConfig};
+#[cfg(feature = "chat")]
+use ql_rpc::{notification::Notification, request::Request, Route};
 use ql_rpc::{
     DownloadHandler, DownloadStart, RequestHandler, Response, RouteId, Router, RpcStream,
     SendSpawner, Spawner, SubscriptionHandler, SubscriptionResponder,
 };
-#[cfg(feature = "chat")]
-use ql_rpc::{notification::Notification, request::Request, Route};
 use ql_runtime::{
     new_runtime, QlInbound, QlPlatform, QlStream, QlTimer, RuntimeConfig, RuntimeHandle,
 };
@@ -148,10 +151,18 @@ impl RequestHandler<route::Echo, QlStream> for RouterState {
         request: EchoRequest,
         responder: Response<EchoResponse, <QlStream as RpcStream>::Writer>,
     ) {
-        println!("[backend] ← inbound Echo {:?} — responding", request.message);
+        println!(
+            "[backend] ← inbound Echo {:?} — responding",
+            request.message
+        );
         let echoed = request.message.clone();
         let started = Instant::now();
-        match responder.respond(EchoResponse { message: echoed.clone() }).await {
+        match responder
+            .respond(EchoResponse {
+                message: echoed.clone(),
+            })
+            .await
+        {
             Ok(()) => {
                 println!("[backend]   .. respond OK ({echoed:?})");
                 #[cfg(feature = "mcp")]
@@ -181,8 +192,16 @@ impl SubscriptionHandler<route::BytesBenchmark, QlStream> for RouterState {
         let mut remaining = total;
         while remaining > 0 {
             let n = remaining.min(BENCHMARK_CHUNK_LEN);
-            if let Err(e) = responder.send(BenchmarkEvent { bytes: vec![0u8; n] }).await {
-                eprintln!("[backend]   .. BytesBenchmark send failed at {} B: {e:?}", total - remaining);
+            if let Err(e) = responder
+                .send(BenchmarkEvent {
+                    bytes: vec![0u8; n],
+                })
+                .await
+            {
+                eprintln!(
+                    "[backend]   .. BytesBenchmark send failed at {} B: {e:?}",
+                    total - remaining
+                );
                 return;
             }
             remaining -= n;
@@ -192,10 +211,7 @@ impl SubscriptionHandler<route::BytesBenchmark, QlStream> for RouterState {
                 let secs = started.elapsed().as_secs_f64();
                 println!("[backend]   .. BytesBenchmark OK ({total} B in {secs:.2}s)");
                 #[cfg(feature = "mcp")]
-                self.emit(mcp::BackendEvent::BenchmarkCompleted {
-                    bytes: total,
-                    secs,
-                });
+                self.emit(mcp::BackendEvent::BenchmarkCompleted { bytes: total, secs });
             }
             Err(e) => eprintln!("[backend]   .. BytesBenchmark finish FAILED: {e:?}"),
         }
@@ -204,10 +220,16 @@ impl SubscriptionHandler<route::BytesBenchmark, QlStream> for RouterState {
 
 #[cfg(feature = "chat")]
 impl RequestHandler<ChatSend, QlStream> for RouterState {
-    async fn handle(self, message: String, responder: Response<String, <QlStream as RpcStream>::Writer>) {
+    async fn handle(
+        self,
+        message: String,
+        responder: Response<String, <QlStream as RpcStream>::Writer>,
+    ) {
         println!("[backend] chat ← from device: {message:?}");
         #[cfg(feature = "mcp")]
-        self.emit(mcp::BackendEvent::ChatReceived { text: message.clone() });
+        self.emit(mcp::BackendEvent::ChatReceived {
+            text: message.clone(),
+        });
         // Ack with the same text — keeps the device UI flow simple and
         // confirms end-to-end delivery.
         let _ = responder.respond(message).await;
@@ -221,7 +243,9 @@ impl DownloadHandler<route::DownloadBenchmark, QlStream> for RouterState {
         download: DownloadStart<route::DownloadBenchmark, <QlStream as RpcStream>::Writer>,
     ) {
         let total = request.length as usize;
-        println!("[backend] ← inbound DownloadBenchmark, length={total} — preparing payload + sha256");
+        println!(
+            "[backend] ← inbound DownloadBenchmark, length={total} — preparing payload + sha256"
+        );
         // Build the deterministic payload (zeros) and its SHA-256 so the
         // device can verify integrity if it wants.
         let payload = vec![0u8; total];
@@ -311,12 +335,7 @@ async fn main() {
                     .expect("--bench-bytes must be a u32")
             }
             #[cfg(feature = "mcp")]
-            "--mcp" => {
-                mcp_addr = Some(
-                    args.next()
-                        .unwrap_or_else(|| DEFAULT_MCP_ADDR.to_string()),
-                )
-            }
+            "--mcp" => mcp_addr = Some(args.next().unwrap_or_else(|| DEFAULT_MCP_ADDR.to_string())),
             #[cfg(feature = "mcp")]
             "--auto-reply" => mcp_auto_reply = true,
             other => panic!("unknown arg: {other}"),
@@ -347,7 +366,8 @@ async fn main() {
     let identity_to_save = identity.clone();
 
     #[cfg(feature = "mcp")]
-    let (mcp_events_tx, _mcp_events_rx_keepalive) = tokio::sync::broadcast::channel::<mcp::BackendEvent>(256);
+    let (mcp_events_tx, _mcp_events_rx_keepalive) =
+        tokio::sync::broadcast::channel::<mcp::BackendEvent>(256);
 
     let (platform, plumbing) = BackendPlatform::new();
     #[cfg(feature = "mcp")]
@@ -377,7 +397,13 @@ async fn main() {
         "XX pairing"
     };
 
-    match await_status(&plumbing.status_rx, PeerStatus::Connected, Duration::from_secs(30)).await {
+    match await_status(
+        &plumbing.status_rx,
+        PeerStatus::Connected,
+        Duration::from_secs(30),
+    )
+    .await
+    {
         Ok(()) => println!("[backend] *** QL v2 session ESTABLISHED ({what} complete) ***"),
         Err(()) => {
             eprintln!("[backend] {what} did not complete within 30s — aborting");
@@ -496,7 +522,9 @@ async fn run_echo(handle: &RuntimeHandle) {
     let started = Instant::now();
     match handle
         .rpc()
-        .request::<route::Echo>(&EchoRequest { message: msg.clone() })
+        .request::<route::Echo>(&EchoRequest {
+            message: msg.clone(),
+        })
         .await
     {
         Ok(reply) => {
@@ -565,10 +593,14 @@ fn parse_invite(raw: &str) -> PairingInvite {
         PairingToken::SIZE,
         bytes.len()
     );
-    assert_eq!(bytes[0], PairingInvite::VERSION, "invite version must be {}", PairingInvite::VERSION);
+    assert_eq!(
+        bytes[0],
+        PairingInvite::VERSION,
+        "invite version must be {}",
+        PairingInvite::VERSION
+    );
     let qid_arr: [u8; QID::SIZE] = bytes[1..1 + QID::SIZE].try_into().unwrap();
-    let token_arr: [u8; PairingToken::SIZE] =
-        bytes[1 + QID::SIZE..].try_into().unwrap();
+    let token_arr: [u8; PairingToken::SIZE] = bytes[1 + QID::SIZE..].try_into().unwrap();
     PairingInvite {
         qid: QID(qid_arr),
         token: PairingToken(token_arr),
@@ -598,11 +630,7 @@ fn ble_config() -> RuntimeConfig {
 // Inbound: read those frames back, btp-decode each, feed the dechunker,
 // and hand any fully reassembled QL2 record to the runtime.
 
-fn spawn_tcp_btp_bridge(
-    outbound: Receiver<Vec<u8>>,
-    inbound: Sender<Vec<u8>>,
-    stream: TcpStream,
-) {
+fn spawn_tcp_btp_bridge(outbound: Receiver<Vec<u8>>, inbound: Sender<Vec<u8>>, stream: TcpStream) {
     let (mut rd, mut wr) = stream.into_split();
 
     tokio::spawn(async move {
@@ -655,7 +683,10 @@ fn spawn_tcp_btp_bridge(
             let h = chunk.header;
             log::debug!(
                 "[rx] frame {frames}: btp chunk msg_id={} idx={}/{} data_len={}",
-                h.message_id, h.index, h.total_chunks, h.data_len
+                h.message_id,
+                h.index,
+                h.total_chunks,
+                h.data_len
             );
             if let Some(record) = dechunker.insert_chunk(chunk) {
                 records += 1;
@@ -798,7 +829,8 @@ impl QlAead for BackendPlatform {
         buffer: &mut [u8],
         auth_tag: &[u8; ql_wire::ENCRYPTED_MESSAGE_AUTH_SIZE],
     ) -> bool {
-        self.crypto.aes256_gcm_decrypt(key, nonce, aad, buffer, auth_tag)
+        self.crypto
+            .aes256_gcm_decrypt(key, nonce, aad, buffer, auth_tag)
     }
 }
 
