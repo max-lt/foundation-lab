@@ -5,8 +5,9 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-default = ["chat"]
+default = ["chat", "mcp"]
 chat = []
+mcp = ["dep:axum", "dep:tokio-stream", "dep:serde", "dep:serde_json", "dep:uuid"]
 
 [dependencies]
 ql-wire = { workspace = true }
@@ -23,3 +24,10 @@ bytes = { workspace = true }
 hex = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+
+# mcp feature
+axum = { version = "0.7", features = ["macros"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }

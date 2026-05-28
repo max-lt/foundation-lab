@@ -53,7 +53,12 @@ use tokio::{
     time::Sleep,
 };
 
+#[cfg(feature = "mcp")]
+mod mcp;
+
 const DEFAULT_RELAY: &str = "127.0.0.1:8766";
+#[cfg(feature = "mcp")]
+const DEFAULT_MCP_ADDR: &str = "127.0.0.1:8780";
 /// Persisted (identity ‖ peer bundle) — its presence selects IK vs XX mode.
 const DEFAULT_STATE: &str = "/tmp/ql-link-lab-peer.state";
 
@@ -104,8 +109,20 @@ impl Notification for ChatPush {
 // client and we must answer. A `Router` dispatches each inbound stream to a
 // handler. `RouterState` is stateless — Echo just reflects the payload.
 
-#[derive(Clone)]
-struct RouterState;
+#[derive(Clone, Default)]
+struct RouterState {
+    #[cfg(feature = "mcp")]
+    events: Option<tokio::sync::broadcast::Sender<mcp::BackendEvent>>,
+}
+
+#[cfg(feature = "mcp")]
+impl RouterState {
+    fn emit(&self, event: mcp::BackendEvent) {
+        if let Some(tx) = &self.events {
+            let _ = tx.send(event);
+        }
+    }
+}
 
 /// Backend-side spawner for the Router. The new ql-rpc API requires the
 /// user to provide a `SendSpawner` (replaces the old built-in `SendSpawn`).
@@ -133,8 +150,17 @@ impl RequestHandler<route::Echo, QlStream> for RouterState {
     ) {
         println!("[backend] ← inbound Echo {:?} — responding", request.message);
         let echoed = request.message.clone();
+        let started = Instant::now();
         match responder.respond(EchoResponse { message: echoed.clone() }).await {
-            Ok(()) => println!("[backend]   .. respond OK ({echoed:?})"),
+            Ok(()) => {
+                println!("[backend]   .. respond OK ({echoed:?})");
+                #[cfg(feature = "mcp")]
+                self.emit(mcp::BackendEvent::EchoHandled {
+                    request: request.message,
+                    response: echoed,
+                    ms: started.elapsed().as_millis(),
+                });
+            }
             Err(e) => eprintln!("[backend]   .. respond FAILED ({echoed:?}): {e:?}"),
         }
     }
@@ -162,10 +188,15 @@ impl SubscriptionHandler<route::BytesBenchmark, QlStream> for RouterState {
             remaining -= n;
         }
         match responder.finish().await {
-            Ok(()) => println!(
-                "[backend]   .. BytesBenchmark OK ({total} B in {:.2}s)",
-                started.elapsed().as_secs_f64()
-            ),
+            Ok(()) => {
+                let secs = started.elapsed().as_secs_f64();
+                println!("[backend]   .. BytesBenchmark OK ({total} B in {secs:.2}s)");
+                #[cfg(feature = "mcp")]
+                self.emit(mcp::BackendEvent::BenchmarkCompleted {
+                    bytes: total,
+                    secs,
+                });
+            }
             Err(e) => eprintln!("[backend]   .. BytesBenchmark finish FAILED: {e:?}"),
         }
     }
@@ -175,6 +206,8 @@ impl SubscriptionHandler<route::BytesBenchmark, QlStream> for RouterState {
 impl RequestHandler<ChatSend, QlStream> for RouterState {
     async fn handle(self, message: String, responder: Response<String, <QlStream as RpcStream>::Writer>) {
         println!("[backend] chat ← from device: {message:?}");
+        #[cfg(feature = "mcp")]
+        self.emit(mcp::BackendEvent::ChatReceived { text: message.clone() });
         // Ack with the same text — keeps the device UI flow simple and
         // confirms end-to-end delivery.
         let _ = responder.respond(message).await;
@@ -226,10 +259,16 @@ impl DownloadHandler<route::DownloadBenchmark, QlStream> for RouterState {
             return;
         }
         match writer.finish().await {
-            Ok(()) => println!(
-                "[backend]   .. DownloadBenchmark OK ({total} B in {:.2}s)",
-                started.elapsed().as_secs_f64()
-            ),
+            Ok(()) => {
+                let secs = started.elapsed().as_secs_f64();
+                println!("[backend]   .. DownloadBenchmark OK ({total} B in {secs:.2}s)");
+                #[cfg(feature = "mcp")]
+                self.emit(mcp::BackendEvent::DownloadCompleted {
+                    bytes: total,
+                    secs,
+                    sha256_hex: hex::encode(SoftwareCrypto.sha256(&[&vec![0u8; total]])),
+                });
+            }
             Err(e) => eprintln!("[backend]   .. DownloadBenchmark finish FAILED: {e:?}"),
         }
     }
@@ -253,6 +292,10 @@ async fn main() {
     let mut bench_len: u32 = 256 * 1024;
     let mut state_path = DEFAULT_STATE.to_string();
     let mut serve = false;
+    #[cfg(feature = "mcp")]
+    let mut mcp_addr: Option<String> = None;
+    #[cfg(feature = "mcp")]
+    let mut mcp_auto_reply = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -267,6 +310,15 @@ async fn main() {
                     .parse()
                     .expect("--bench-bytes must be a u32")
             }
+            #[cfg(feature = "mcp")]
+            "--mcp" => {
+                mcp_addr = Some(
+                    args.next()
+                        .unwrap_or_else(|| DEFAULT_MCP_ADDR.to_string()),
+                )
+            }
+            #[cfg(feature = "mcp")]
+            "--auto-reply" => mcp_auto_reply = true,
             other => panic!("unknown arg: {other}"),
         }
     }
@@ -294,7 +346,16 @@ async fn main() {
     };
     let identity_to_save = identity.clone();
 
+    #[cfg(feature = "mcp")]
+    let (mcp_events_tx, _mcp_events_rx_keepalive) = tokio::sync::broadcast::channel::<mcp::BackendEvent>(256);
+
     let (platform, plumbing) = BackendPlatform::new();
+    #[cfg(feature = "mcp")]
+    let platform = if mcp_addr.is_some() {
+        platform.with_mcp_events(mcp_events_tx.clone())
+    } else {
+        platform
+    };
     let (runtime, handle) = new_runtime(identity, platform, ble_config());
 
     tokio::spawn(async move {
@@ -342,18 +403,39 @@ async fn main() {
         println!(
             "[backend] serve mode — Router up (Echo). Waiting for device-initiated RPC; Ctrl-C to stop."
         );
+        let router_state = RouterState {
+            #[cfg(feature = "mcp")]
+            events: mcp_addr.as_ref().map(|_| mcp_events_tx.clone()),
+        };
         let builder = Router::<RouterState, QlStream, TokioSendSpawn>::builder_send(TokioSendSpawn)
             .request::<route::Echo>()
             .subscription::<route::BytesBenchmark>()
             .download::<route::DownloadBenchmark>();
         #[cfg(feature = "chat")]
         let builder = builder.request::<ChatSend>();
-        let router = builder.build(RouterState);
+        let router = builder.build(router_state);
 
         #[cfg(feature = "chat")]
         {
             let push_handle = handle.clone();
             tokio::spawn(chat_input_loop(push_handle, "127.0.0.1:9999".to_string()));
+        }
+
+        #[cfg(feature = "mcp")]
+        if let Some(addr_str) = mcp_addr.clone() {
+            let addr: std::net::SocketAddr =
+                addr_str.parse().expect("--mcp address must be host:port");
+            let mcp_state = mcp::McpState::new(handle.clone(), mcp_events_tx.clone());
+            tokio::spawn(mcp::run_event_recorder(mcp_state.clone()));
+            if mcp_auto_reply {
+                println!("[mcp] auto-reply enabled (device chats are forwarded to MCP sampling)");
+                tokio::spawn(mcp::run_chat_auto_reply(mcp_state.clone()));
+            }
+            tokio::spawn(async move {
+                if let Err(e) = mcp::serve(addr, mcp_state).await {
+                    eprintln!("[mcp] server error: {e}");
+                }
+            });
         }
         loop {
             match plumbing.inbound_streams_rx.recv().await {
@@ -609,6 +691,8 @@ struct BackendPlatform {
     peer: Sender<PeerBundle>,
     inbound_streams: Sender<QlStream>,
     crypto: SoftwareCrypto,
+    #[cfg(feature = "mcp")]
+    mcp_events: Option<tokio::sync::broadcast::Sender<mcp::BackendEvent>>,
 }
 
 impl BackendPlatform {
@@ -626,6 +710,8 @@ impl BackendPlatform {
                 peer: peer_tx,
                 inbound_streams: inbound_streams_tx,
                 crypto: SoftwareCrypto,
+                #[cfg(feature = "mcp")]
+                mcp_events: None,
             },
             Plumbing {
                 outbound_rx,
@@ -635,6 +721,12 @@ impl BackendPlatform {
                 inbound_streams_rx,
             },
         )
+    }
+
+    #[cfg(feature = "mcp")]
+    fn with_mcp_events(mut self, tx: tokio::sync::broadcast::Sender<mcp::BackendEvent>) -> Self {
+        self.mcp_events = Some(tx);
+        self
     }
 }
 
@@ -757,6 +849,14 @@ impl QlPlatform for BackendPlatform {
     fn handle_peer_status(&self, peer: Option<QID>, status: PeerStatus) {
         log::info!("[status] peer={peer:?} status={status:?}");
         let _ = self.status.try_send(status);
+        #[cfg(feature = "mcp")]
+        if let Some(tx) = &self.mcp_events {
+            let _ = tx.send(mcp::BackendEvent::StatusChanged {
+                state: status,
+                bt_connected: matches!(status, PeerStatus::Connected | PeerStatus::Initiator),
+                peer_known: peer.is_some(),
+            });
+        }
     }
 
     fn handle_inbound(&self, stream: QlStream) {
