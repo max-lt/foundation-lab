@@ -59,7 +59,10 @@ use tokio::{
 #[cfg(feature = "mcp")]
 mod mcp;
 
-const DEFAULT_RELAY: &str = "127.0.0.1:8766";
+/// Default TCP peer for the backend to dial. Points at the relay listening
+/// on 8766; override with `--connect-to 127.0.0.1:8765` to skip the relay
+/// and talk to the sim's `os/bt` bridge directly.
+const DEFAULT_PEER: &str = "127.0.0.1:8766";
 #[cfg(feature = "mcp")]
 const DEFAULT_MCP_ADDR: &str = "127.0.0.1:8780";
 /// Persisted (identity ‖ peer bundle) — its presence selects IK vs XX mode.
@@ -311,7 +314,7 @@ async fn main() {
     .init();
 
     let mut args = std::env::args().skip(1);
-    let mut relay = DEFAULT_RELAY.to_string();
+    let mut peer = DEFAULT_PEER.to_string();
     let mut token_hex: Option<String> = None;
     let mut bench_len: u32 = 256 * 1024;
     let mut state_path = DEFAULT_STATE.to_string();
@@ -323,7 +326,8 @@ async fn main() {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--relay" => relay = args.next().expect("--relay needs an address"),
+            // Address to dial — either a relay or the sim's bt-server bridge directly.
+            "--connect-to" => peer = args.next().expect("--connect-to needs an address"),
             "--token" => token_hex = Some(args.next().expect("--token needs a value")),
             "--state" => state_path = args.next().expect("--state needs a path"),
             "--serve" => serve = true,
@@ -346,10 +350,10 @@ async fn main() {
     // (identity ‖ peer bundle) means we've paired before → reconnect IK.
     let ik_mode = Path::new(&state_path).exists();
 
-    println!("[backend] connecting to relay {relay}");
-    let stream = TcpStream::connect(&relay)
+    println!("[backend] connecting to {peer}");
+    let stream = TcpStream::connect(&peer)
         .await
-        .unwrap_or_else(|e| panic!("[backend] cannot reach relay {relay}: {e}"));
+        .unwrap_or_else(|e| panic!("[backend] cannot reach {peer}: {e}"));
     stream.set_nodelay(true).ok();
 
     // IK mode reuses the identity the device already knows; XX mints a fresh one.
@@ -573,7 +577,7 @@ async fn run_benchmark(handle: &RuntimeHandle, length: u32) {
     let kbps = (received as f64 / 1024.0) / secs;
     println!(
         "[backend] benchmark ← {received} bytes in {secs:.2}s = {kbps:.1} KiB/s \
-         end-to-end (device → relay → backend, QL v2)"
+         end-to-end (device → backend, QL v2)"
     );
 }
 
@@ -661,7 +665,7 @@ fn spawn_tcp_btp_bridge(outbound: Receiver<Vec<u8>>, inbound: Sender<Vec<u8>>, s
         loop {
             let mut len_buf = [0u8; 4];
             if rd.read_exact(&mut len_buf).await.is_err() {
-                log::error!("[rx] transport closed by relay (after {frames} frames in)");
+                log::error!("[rx] transport closed by peer (after {frames} frames in)");
                 return;
             }
             let len = u32::from_be_bytes(len_buf) as usize;
