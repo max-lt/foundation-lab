@@ -1,0 +1,19 @@
+# Standalone workspace, NOT a member of the parent ql-link-lab workspace: v1
+# needs btp + foundation-api @ tag 5.7.0, which collides with the v2 crates' btp
+# @ 5.6.2 (cargo forbids two git revs of one package name per lockfile).
+[workspace]
+
+[package]
+name = "v1-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+foundation-api = { git = "https://github.com/Foundation-Devices/foundation-api", tag = "5.7.0" }
+btp = { git = "https://github.com/Foundation-Devices/foundation-api", tag = "5.7.0" }
+chrono = "0.4"
+hex = "0.4"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
