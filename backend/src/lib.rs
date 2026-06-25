@@ -33,8 +33,8 @@ use async_channel::{Receiver, Sender};
 use futures_lite::Stream;
 use ql_api::{
     route, BenchmarkEvent, BenchmarkRequest, DownloadBenchmarkHeader, DownloadBenchmarkPartHeader,
-    DownloadBenchmarkRequest, EchoRequest, EchoResponse, ExchangeRate,
-    ExchangeRateSubscriptionRequest,
+    DownloadBenchmarkRequest, EchoRequest, EchoResponse, ExchangeRate, ExchangeRateHistory,
+    ExchangeRateHistoryRequest, ExchangeRateSubscriptionRequest,
 };
 use ql_common::{StreamInfo, QID};
 #[cfg(feature = "chat")]
@@ -256,6 +256,24 @@ impl SubscriptionHandler<route::ExchangeRateSubscription, QlStream> for RouterSt
             })
             .await;
         std::future::pending::<()>().await;
+    }
+}
+
+// The launcher also requests exchange-rate history (route 702) on connect.
+// Answer with an empty history so the request completes instead of resetting.
+impl RequestHandler<route::ExchangeRateHistory, QlStream> for RouterState {
+    async fn handle(
+        self,
+        _context: ql_rpc::Context,
+        request: ExchangeRateHistoryRequest,
+        responder: Response<ExchangeRateHistory, <QlStream as RpcStream>::Writer>,
+    ) {
+        let _ = responder
+            .respond(ExchangeRateHistory {
+                history: Vec::new(),
+                currency_code: request.currency_code,
+            })
+            .await;
     }
 }
 
@@ -487,6 +505,7 @@ pub async fn run(args: Vec<String>) {
             .request::<route::Echo>()
             .subscription::<route::BytesBenchmark>()
             .subscription::<route::ExchangeRateSubscription>()
+            .request::<route::ExchangeRateHistory>()
             .download::<route::DownloadBenchmark>();
         #[cfg(feature = "chat")]
         let builder = builder.request::<ChatSend>();
