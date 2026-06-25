@@ -1,4 +1,4 @@
-# ql-link-lab
+# foundation-lab
 
 A laboratory for running an end-to-end **QuantumLink v2** session against
 the KeyOS hosted simulator, without a real Passport Prime device.
@@ -62,11 +62,11 @@ just sim
 # (logged as `gui_app_qlv2: QLV2_PAIRING_QR 12:34:56:78:9A:BC:<hex>`).
 
 # 2. Relay
-cd ql-link-lab
+cd foundation-lab
 cargo run --release --bin relay
 
 # 3. Backend (first-time XX pairing, with MCP)
-cd ql-link-lab
+cd foundation-lab
 cargo run --release --bin backend --features mcp -- \
     --serve --mcp 127.0.0.1:8780 \
     --token 12:34:56:78:9A:BC:01a094fe40eb1392b66b1529555756108a<…>
@@ -76,7 +76,7 @@ On a successful XX handshake the backend will log:
 
 ```
 [backend] *** QL v2 session ESTABLISHED (XX pairing complete) ***
-[backend] saved peer state to /tmp/ql-link-lab-peer.state — next run reconnects via IK
+[backend] saved peer state to /tmp/foundation-lab-peer.state — next run reconnects via IK
 [backend] serve mode — Router up (Echo). Waiting for device-initiated RPC; Ctrl-C to stop.
 [mcp] server listening on http://127.0.0.1:8780
 ```
@@ -100,7 +100,7 @@ Subsequent runs reconnect via **IK** with no token — just
 Runs once: Echo round-trip + BytesBenchmark download, prints
 throughput, exits.
 
-**Pairing state** is persisted to `/tmp/ql-link-lab-peer.state` after a
+**Pairing state** is persisted to `/tmp/foundation-lab-peer.state` after a
 successful XX. Delete this file to force fresh pairing.
 
 ## MCP server (`--mcp`)
@@ -160,7 +160,7 @@ see [anthropics/claude-code#1785](https://github.com/anthropics/claude-code/issu
 With Claude Code:
 
 ```bash
-claude mcp add ql-link-lab http://127.0.0.1:8780/sse --transport sse
+claude mcp add foundation-lab http://127.0.0.1:8780/sse --transport sse
 ```
 
 With Claude Desktop, edit `claude_desktop_config.json` similarly.
@@ -207,12 +207,12 @@ opaque: it ships bytes between two sockets and never sees plaintext.
   the loop just logs warnings on every chat — the round-trip can't
   complete.
 - **State file is plaintext.** The persisted `(identity ‖ peer bundle)`
-  in `/tmp/ql-link-lab-peer.state` is not encrypted. Fine for local dev.
+  in `/tmp/foundation-lab-peer.state` is not encrypted. Fine for local dev.
 
 ## File layout
 
 ```
-ql-link-lab/
+foundation-lab/
 ├── Cargo.toml            workspace + dep pins
 ├── README.md             this file
 ├── relay/

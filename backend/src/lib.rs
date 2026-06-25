@@ -66,7 +66,7 @@ const DEFAULT_PEER: &str = "127.0.0.1:8766";
 #[cfg(feature = "mcp")]
 const DEFAULT_MCP_ADDR: &str = "127.0.0.1:8780";
 /// Persisted (identity ‖ peer bundle) — its presence selects IK vs XX mode.
-const DEFAULT_STATE: &str = "/tmp/ql-link-lab-peer.state";
+const DEFAULT_STATE: &str = "/tmp/foundation-lab-peer.state";
 
 // ===== RPC surface =====
 //
@@ -373,7 +373,7 @@ pub async fn run(args: Vec<String>) {
         (id, Some(bundle))
     } else {
         println!("[backend] XX mode — fresh pairing (no state at {state_path})");
-        let id = generate_identity(&SoftwareCrypto, "ql-link-lab backend")
+        let id = generate_identity(&SoftwareCrypto, "foundation-lab backend")
             .expect("generate_identity failed");
         (id, None)
     };

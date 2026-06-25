@@ -19,6 +19,9 @@ pub struct Args {
     /// Substring of the reader name to use (default: the first reader).
     #[arg(long)]
     reader: Option<String>,
+    /// Index of the reader from the printed list; takes precedence over --reader.
+    #[arg(long, short)]
+    index: Option<usize>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -30,16 +33,19 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     println!("readers:");
-    for r in &readers {
-        println!("  - {}", r.to_string_lossy());
+    for (i, r) in readers.iter().enumerate() {
+        println!("  [{i}] {}", r.to_string_lossy());
     }
 
-    let reader = match &args.reader {
-        Some(want) => *readers
+    let reader = match (args.index, &args.reader) {
+        (Some(i), _) => *readers
+            .get(i)
+            .with_context(|| format!("no reader at index {i} (have {} readers)", readers.len()))?,
+        (None, Some(want)) => *readers
             .iter()
             .find(|r| r.to_string_lossy().contains(want.as_str()))
             .with_context(|| format!("no reader matching {want:?}"))?,
-        None => readers[0],
+        (None, None) => readers[0],
     };
     println!("\nusing reader: {}\n", reader.to_string_lossy());
 

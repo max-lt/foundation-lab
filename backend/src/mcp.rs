@@ -1,4 +1,4 @@
-//! MCP server (HTTP+SSE transport) exposing ql-link-lab to a model client.
+//! MCP server (HTTP+SSE transport) exposing foundation-lab to a model client.
 //!
 //! Lets an external AI agent (Claude Desktop, MCP Inspector, Cline, …)
 //! drive the device side of the QL v2 session — push chat messages,
@@ -390,7 +390,7 @@ pub async fn run_chat_auto_reply(state: McpState) {
     let system_prompt =
         "You are an AI assistant chatting with a KeyOS Passport Prime hardware wallet user. \
          Keep replies short (one or two sentences), warm, and informational. \
-         You are bridged via QL v2 → relay → ql-link-lab backend → MCP sampling.";
+         You are bridged via QL v2 → relay → foundation-lab backend → MCP sampling.";
 
     while let Ok(event) = rx.recv().await {
         // Only react to inbound chat — anything else is someone else's job.
@@ -681,7 +681,7 @@ async fn dispatch(state: &McpState, req: &JsonRpcRequest) -> Value {
                 "logging": {},
             },
             "serverInfo": {
-                "name": "ql-link-lab",
+                "name": "foundation-lab",
                 "version": env!("CARGO_PKG_VERSION"),
             },
         }),

@@ -4,7 +4,7 @@ A standalone QL v1 companion/Envoy peer that pairs with the hosted KeyOS sim ove
 the BLE-over-TCP bridge (`KeyOS-dev/os/bt/src/hosted.rs`, `:8765`). It seals a
 `PairingRequest` to the device, completes the v1 handshake, and sends one
 `EnvoyStatus`. Standalone workspace because v1 pins `foundation-api`/`btp` @ tag
-5.7.0, which conflicts with the parent ql-link-lab (v2) crates' btp.
+5.7.0, which conflicts with the parent foundation-lab (v2) crates' btp.
 
 ## Run
 

@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     // 1. PairingRequest carrying our XID document (CBOR bytes), sealed to the device.
     let pairing = QuantumLinkMessage::PairingRequest(PairingRequest {
         xid_document: me.xid_document.to_cbor_data(),
-        device_name: "ql-link-lab v1".to_string(),
+        device_name: "foundation-lab v1".to_string(),
     });
     send(&mut t, pairing, &my_priv, &me.xid_document, &device_xid)?;
     log::info!("sent PairingRequest, awaiting PairingResponse");
@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
                 log::info!("paired with {sender:?}: {resp:?}");
                 // 3. One demo message after pairing, then exit.
                 let status = QuantumLinkMessage::EnvoyStatus(EnvoyStatus {
-                    version: "ql-link-lab/0.1".to_string(),
+                    version: "foundation-lab/0.1".to_string(),
                 });
                 send(&mut t, status, &my_priv, &me.xid_document, &device_xid)?;
                 log::info!("sent EnvoyStatus; done");
