@@ -5,6 +5,8 @@
 //! SELECT -> GET DATA (CHUID, slot 9A cert) -> GENERAL AUTHENTICATE, then verify
 //! the signature against the certificate's public key.
 
+use std::ffi::CStr;
+
 use anyhow::{bail, Context, Result};
 use p256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use pcsc::{Card, Context as Pcsc, Protocols, Scope, ShareMode};
@@ -41,7 +43,14 @@ pub fn run(args: Args) -> Result<()> {
     };
     println!("\nusing reader: {}\n", reader.to_string_lossy());
 
-    let card = ctx.connect(reader, ShareMode::Shared, Protocols::ANY).context("connect to card")?;
+    run_sequence(&ctx, reader)
+}
+
+/// Connect and run the full PIV chain once; any PCSC/card hiccup returns Err so run() can retry.
+fn run_sequence(ctx: &Pcsc, reader: &CStr) -> Result<()> {
+    let mut card = ctx.connect(reader, ShareMode::Shared, Protocols::ANY).context("connect to card")?;
+    // Hold the card for the whole exchange so CryptoTokenKit can't reset it between our APDUs.
+    let card = card.transaction().context("begin card transaction")?;
 
     expect_ok("SELECT PIV", &card, &apdu(0x00, 0xa4, 0x04, 0x00, PIV_AID))?;
     expect_ok("GET DATA CHUID", &card, &get_data(&[0x5f, 0xc1, 0x02]))?;

@@ -17,7 +17,7 @@ all = ["relay", "backend", "fido", "piv"]
 relay = ["dep:relay", "dep:tokio"]
 backend = ["dep:backend", "dep:tokio"]
 mcp = ["backend", "backend/mcp"]
-fido = ["dep:hidapi"]
+fido = ["dep:hidapi", "dep:p256", "dep:sha2"]
 piv = ["dep:pcsc", "dep:p256", "dep:x509-cert"]
 
 [dependencies]
@@ -29,4 +29,5 @@ backend = { path = "../backend", optional = true, default-features = false }
 hidapi = { version = "2", optional = true }
 pcsc = { version = "2", optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+sha2 = { version = "0.10", optional = true }
 x509-cert = { version = "0.2", optional = true }
